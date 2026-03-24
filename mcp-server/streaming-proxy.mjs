@@ -19,7 +19,7 @@ import http from "node:http";
 import { spawn, execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID, createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -327,7 +327,7 @@ async function streamChunked(res, id, model, text) {
 
 // ── Spawn cursor-agent ──────────────────────────────────────────────────────
 
-function spawnCursorAgent(userMsg, sessionKey, requestModel, { skipSession = false } = {}) {
+function spawnCursorAgent(userMsg, sessionKey, requestModel, { skipSession = false, cwd } = {}) {
   const cursorSessionId = !skipSession && sessionKey ? sessions.get(sessionKey) : null;
   const args = ["-p", "--output-format", OUTPUT_FORMAT, "--stream-partial-output", "--trust", "--approve-mcps", "--force"];
   const model = mapRequestModel(requestModel);
@@ -339,8 +339,10 @@ function spawnCursorAgent(userMsg, sessionKey, requestModel, { skipSession = fal
   // cmd.exe when needed.
   const needsShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(CURSOR_PATH);
 
+  const effectiveCwd = (typeof cwd === "string" && cwd.trim()) || WORKSPACE_DIR || undefined;
+
   const child = spawn(CURSOR_PATH, args, {
-    cwd: WORKSPACE_DIR || undefined,
+    cwd: effectiveCwd,
     env: { ...process.env, ...(process.platform !== "win32" && { SHELL: process.env.SHELL || "/bin/bash" }) },
     shell: needsShell,
     stdio: ["pipe", "pipe", "pipe"],
@@ -361,27 +363,120 @@ function spawnCursorAgent(userMsg, sessionKey, requestModel, { skipSession = fal
 
 const CONV_INFO_RE = /Conversation info \(untrusted metadata\):\s*```json\s*(\{[\s\S]*?\})\s*```/;
 
-function extractSessionFromMeta(messages) {
+/** Roles that may carry OpenClaw "Conversation info" blocks (gateway often prepends system context). */
+const CONV_INFO_ROLES = new Set(["user", "system", "assistant"]);
+
+function findLastConvInfoJson(messages) {
   if (!Array.isArray(messages)) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
-    if (m.role !== "user") continue;
+    if (!CONV_INFO_ROLES.has(m.role)) continue;
     const text = typeof m.content === "string" ? m.content
       : Array.isArray(m.content) ? m.content.filter((c) => c.type === "text").map((c) => c.text).join("\n")
       : "";
     const match = text.match(CONV_INFO_RE);
     if (!match) continue;
     try {
-      const info = JSON.parse(match[1]);
-      if (info.is_group_chat && info.group_channel) {
-        return `auto:grp:${info.group_channel}:${info.topic_id || "main"}`;
-      }
-      if (info.sender_id) {
-        return `auto:dm:${info.sender_id}`;
-      }
+      return JSON.parse(match[1]);
     } catch {}
   }
   return null;
+}
+
+/** Discord snowflake from a single parsed conv-info object (channel_id field or conversation_label). */
+function channelIdFromConvInfo(info) {
+  if (!info || typeof info !== "object") return null;
+  if (info.channel_id != null) return String(info.channel_id);
+  const label = info.conversation_label;
+  if (typeof label === "string") {
+    const m = label.match(/channel id:(\d+)/i);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Discord snowflake for the channel/thread, for binding → agent workspace (see openclaw.json bindings). */
+function extractChannelIdFromMeta(messages) {
+  return channelIdFromConvInfo(findLastConvInfoJson(messages));
+}
+
+function truthyGroupFlag(v) {
+  return v === true || v === "true" || v === 1 || v === "1";
+}
+
+/** Guild/channel context: do not fall through to per-sender DM session. */
+function isGuildOrGroupConversation(info) {
+  if (!info || typeof info !== "object") return false;
+  if (truthyGroupFlag(info.is_group_chat)) return true;
+  const gs = info.group_space;
+  if (gs != null && String(gs).trim() !== "" && !/^0+$/.test(String(gs).trim())) return true;
+  return false;
+}
+
+function extractSessionFromMeta(messages) {
+  const info = findLastConvInfoJson(messages);
+  if (!info || typeof info !== "object") return null;
+  try {
+    const channelId = channelIdFromConvInfo(info);
+    const guildLike = isGuildOrGroupConversation(info);
+    if (guildLike) {
+      const grpPart =
+        channelId ||
+        (info.group_channel != null && String(info.group_channel).trim() !== "" ? String(info.group_channel).trim() : null) ||
+        (info.group_subject != null && String(info.group_subject).trim() !== "" ? String(info.group_subject).trim() : null);
+      if (grpPart) {
+        const topic = info.topic_id != null && String(info.topic_id).trim() !== "" ? String(info.topic_id).trim() : "main";
+        return `auto:grp:${grpPart}:${topic}`;
+      }
+    }
+    if (info.sender_id) {
+      return `auto:dm:${info.sender_id}`;
+    }
+  } catch {}
+  return null;
+}
+
+/** Cached Discord channel id → workspace; invalidated when openclaw.json mtime changes */
+let discordChannelWorkspaceState = { mtime: NaN, map: new Map() };
+
+/** Map Discord channel id → agent workspace from ~/.openclaw/openclaw.json bindings + agents.list */
+function getDiscordChannelWorkspaceMap() {
+  if (!existsSync(openclawPath)) return new Map();
+  try {
+    const st = statSync(openclawPath);
+    if (Number.isFinite(discordChannelWorkspaceState.mtime) && st.mtimeMs === discordChannelWorkspaceState.mtime) {
+      return discordChannelWorkspaceState.map;
+    }
+    const map = new Map();
+    const cfg = JSON.parse(readFileSync(openclawPath, "utf-8"));
+    const agents = cfg.agents?.list || [];
+    const workspaceByAgentId = new Map();
+    for (const a of agents) {
+      if (a.id && a.workspace) workspaceByAgentId.set(a.id, a.workspace);
+    }
+    const defaultWs = cfg.agents?.defaults?.workspace || "";
+    for (const b of cfg.bindings || []) {
+      const agentId = b.agentId;
+      const match = b.match;
+      if (!agentId || !match || match.channel !== "discord") continue;
+      const peer = match.peer;
+      if (!peer || peer.kind !== "channel" || peer.id == null) continue;
+      const ws = workspaceByAgentId.get(agentId) || defaultWs;
+      if (ws) map.set(String(peer.id), ws);
+    }
+    discordChannelWorkspaceState = { mtime: st.mtimeMs, map };
+    return map;
+  } catch {
+    return discordChannelWorkspaceState.map;
+  }
+}
+
+function resolveWorkspaceDirForMessages(messages) {
+  const channelId = extractChannelIdFromMeta(messages);
+  if (!channelId) return WORKSPACE_DIR || null;
+  const map = getDiscordChannelWorkspaceMap();
+  const bound = map.get(channelId);
+  return bound || WORKSPACE_DIR || null;
 }
 
 // ── Stream output processor (reusable for retry) ────────────────────────────
@@ -564,9 +659,10 @@ async function handleStream(req, res, body) {
   const startTime = Date.now();
   const effectiveTimeout = getEffectiveTimeout();
 
-  log("info", `[${requestId}] stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
+  const requestWorkspace = resolveWorkspaceDirForMessages(body.messages);
+  log("info", `[${requestId}] stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${requestWorkspace || WORKSPACE_DIR || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
 
-  let child = spawnCursorAgent(userMsg, sessionKey, model);
+  let child = spawnCursorAgent(userMsg, sessionKey, model, { cwd: requestWorkspace || undefined });
   let clientGone = false;
   let timedOut = false;
 
@@ -620,7 +716,7 @@ async function handleStream(req, res, body) {
     sessions.delete(sessionKey);
     saveSessions(sessions);
     log("warn", `[${requestId}] empty response with session, retrying without resume`);
-    child = spawnCursorAgent(userMsg, sessionKey, model, { skipSession: true });
+    child = spawnCursorAgent(userMsg, sessionKey, model, { skipSession: true, cwd: requestWorkspace || undefined });
     const retryTimeout = setTimeout(() => {
       timedOut = true;
       log("warn", `[${requestId}] retry timeout after ${effectiveTimeout}ms, killing cursor-agent`);
@@ -767,14 +863,15 @@ async function handleNonStream(req, res, body) {
   const startTime = Date.now();
   const effectiveTimeout = getEffectiveTimeout();
 
-  log("info", `[${requestId}] non-stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
+  const requestWorkspace = resolveWorkspaceDirForMessages(body.messages);
+  log("info", `[${requestId}] non-stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${requestWorkspace || WORKSPACE_DIR || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
 
   const sendError = (err) => {
     res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: { message: `cursor-agent error: ${err?.message ?? String(err)}` } }));
   };
 
-  let child = spawnCursorAgent(userMsg, sessionKey, model);
+  let child = spawnCursorAgent(userMsg, sessionKey, model, { cwd: requestWorkspace || undefined });
   let timedOut = false;
 
   const timeout = setTimeout(() => {
@@ -801,7 +898,7 @@ async function handleNonStream(req, res, body) {
     sessions.delete(sessionKey);
     saveSessions(sessions);
     log("warn", `[${requestId}] empty response with session, retrying without resume`);
-    child = spawnCursorAgent(userMsg, sessionKey, model, { skipSession: true });
+    child = spawnCursorAgent(userMsg, sessionKey, model, { skipSession: true, cwd: requestWorkspace || undefined });
     const retryTimeout = setTimeout(() => {
       timedOut = true;
       log("warn", `[${requestId}] retry timeout after ${effectiveTimeout}ms, killing cursor-agent`);
