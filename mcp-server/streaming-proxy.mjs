@@ -20,7 +20,7 @@ import { spawn, execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -235,12 +235,58 @@ function saveSessions(map) {
 
 const sessions = loadSessions();
 
-function setSession(key, value) {
+/**
+ * Persist cursor-agent chat id. Optional `workspaceResolved` (absolute path) is stored so we can
+ * skip --resume when OpenClaw's bound workspace changes; resumed sessions otherwise keep a stale workspace.
+ */
+function setSession(key, sessionId, workspaceResolved) {
+  if (!key || !sessionId) return;
+  const payload =
+    workspaceResolved && String(workspaceResolved).trim()
+      ? { sessionId, workspace: resolve(String(workspaceResolved).trim()) }
+      : { sessionId };
   const old = sessions.get(key);
-  if (old === value) return;
+  if (typeof old === "object" && old?.sessionId === payload.sessionId) {
+    const ow = old.workspace ? resolve(old.workspace) : "";
+    const nw = payload.workspace ? resolve(payload.workspace) : "";
+    if (ow === nw) return;
+  }
   sessions.delete(key);
-  sessions.set(key, value);
+  sessions.set(key, payload);
   saveSessions(sessions);
+}
+
+/** @returns {string|null} cursor-agent resume id, or null if workspace no longer matches stored session */
+function getResumeSessionId(sessionKey, workspaceResolved) {
+  if (!sessionKey) return null;
+  const entry = sessions.get(sessionKey);
+  if (!entry) return null;
+  if (typeof entry === "string") {
+    const want = workspaceResolved && String(workspaceResolved).trim() ? resolve(String(workspaceResolved).trim()) : "";
+    // Legacy map had no workspace; --resume would keep cursor-agent on whatever workspace the chat was
+    // created with. Skip once so the next successful turn re-saves { sessionId, workspace }.
+    if (want) {
+      log(
+        "info",
+        `resume skipped: legacy session entry for ${sessionKey} (no workspace pin); fresh session with ${want}`,
+      );
+      return null;
+    }
+    return entry;
+  }
+  if (entry?.sessionId) {
+    const stored = entry.workspace ? resolve(entry.workspace) : "";
+    const want = workspaceResolved && String(workspaceResolved).trim() ? resolve(String(workspaceResolved).trim()) : "";
+    if (stored && want && stored !== want) {
+      log(
+        "info",
+        `resume skipped: workspace mismatch for ${sessionKey} (stored=${stored}, want=${want})`,
+      );
+      return null;
+    }
+    return entry.sessionId;
+  }
+  return null;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -327,22 +373,36 @@ async function streamChunked(res, id, model, text) {
 
 // ── Spawn cursor-agent ──────────────────────────────────────────────────────
 
+/** Resolve spawn cwd from per-request override and/or plugin default (WORKSPACE_DIR). */
+function computeSpawnCwd(cwdParam) {
+  const raw = (typeof cwdParam === "string" && cwdParam.trim()) || (WORKSPACE_DIR && String(WORKSPACE_DIR).trim()) || "";
+  if (!raw) return { raw: "", resolved: "" };
+  return { raw, resolved: resolve(raw) };
+}
+
 function spawnCursorAgent(userMsg, sessionKey, requestModel, { skipSession = false, cwd } = {}) {
-  const cursorSessionId = !skipSession && sessionKey ? sessions.get(sessionKey) : null;
+  const { raw: cwdRaw, resolved: cwdResolved } = computeSpawnCwd(cwd);
+  const cursorSessionId =
+    !skipSession && sessionKey ? getResumeSessionId(sessionKey, cwdResolved) : null;
+
   const args = ["-p", "--output-format", OUTPUT_FORMAT, "--stream-partial-output", "--trust", "--approve-mcps", "--force"];
+  if (cwdRaw) args.push("--workspace", cwdResolved);
   const model = mapRequestModel(requestModel);
   if (model) args.push("--model", model);
   if (cursorSessionId) args.push("--resume", cursorSessionId);
+
+  log(
+    "debug",
+    `cursor-agent: cwd=${cwdRaw || "(unset)"} resume=${cursorSessionId ? "yes" : "no"} argv=${[CURSOR_PATH, ...args].map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`,
+  );
 
   // On Windows, Cursor may be installed as a .cmd/.bat shim; spawning
   // these directly without a shell throws EINVAL. Let Node route through
   // cmd.exe when needed.
   const needsShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(CURSOR_PATH);
 
-  const effectiveCwd = (typeof cwd === "string" && cwd.trim()) || WORKSPACE_DIR || undefined;
-
   const child = spawn(CURSOR_PATH, args, {
-    cwd: effectiveCwd,
+    cwd: cwdRaw || undefined,
     env: { ...process.env, ...(process.platform !== "win32" && { SHELL: process.env.SHELL || "/bin/bash" }) },
     shell: needsShell,
     stdio: ["pipe", "pipe", "pipe"],
@@ -500,7 +560,7 @@ function ensureStreamHeaders(res, streamState) {
  * - content: thinking appears in message body as markdown blockquote ("> 💭 ..."); separator "---" before body; stream thinking as content deltas, then resultText with "\n\n---\n\n" prefix if no "text" deltas were received.
  * - reasoning_content: thinking in separate field (delta.reasoning_content / message.reasoning_content); stream thinking as reasoning_content deltas, then resultText as content (no separator).
  */
-function processStreamOutput(child, { requestId, model, sessionKey, res, streamState }) {
+function processStreamOutput(child, { requestId, model, sessionKey, res, streamState, sessionWorkspaceResolved }) {
   return new Promise((resolve) => {
     let resolved = false;
     let resultText = "";
@@ -530,7 +590,9 @@ function processStreamOutput(child, { requestId, model, sessionKey, res, streamS
 
       log("debug", `[${requestId}] event: ${JSON.stringify({ type: parsed.type, subtype: parsed.subtype, hasText: !!parsed.text, hasResult: !!parsed.result })}`);
 
-      if (parsed.session_id && sessionKey) setSession(sessionKey, parsed.session_id);
+      if (parsed.session_id && sessionKey) {
+        setSession(sessionKey, parsed.session_id, sessionWorkspaceResolved || undefined);
+      }
 
       const type = parsed.type;
 
@@ -660,7 +722,8 @@ async function handleStream(req, res, body) {
   const effectiveTimeout = getEffectiveTimeout();
 
   const requestWorkspace = resolveWorkspaceDirForMessages(body.messages);
-  log("info", `[${requestId}] stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${requestWorkspace || WORKSPACE_DIR || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
+  const { raw: effWsRaw, resolved: effWsResolved } = computeSpawnCwd(requestWorkspace || undefined);
+  log("info", `[${requestId}] stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${effWsRaw || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
 
   let child = spawnCursorAgent(userMsg, sessionKey, model, { cwd: requestWorkspace || undefined });
   let clientGone = false;
@@ -683,7 +746,11 @@ async function handleStream(req, res, body) {
     log("info", `[${requestId}] client disconnected after ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   });
 
-  let result = await processStreamOutputWithTimeout(child, { requestId, model, sessionKey, res, streamState }, effectiveTimeout);
+  let result = await processStreamOutputWithTimeout(
+    child,
+    { requestId, model, sessionKey, res, streamState, sessionWorkspaceResolved: effWsResolved },
+    effectiveTimeout,
+  );
 
   if (clientGone) {
     log("info", `[${requestId}] agent finished after client disconnect, ${((Date.now() - startTime) / 1000).toFixed(1)}s, resultLen=${(result.resultText || "").length}`);
@@ -722,7 +789,11 @@ async function handleStream(req, res, body) {
       log("warn", `[${requestId}] retry timeout after ${effectiveTimeout}ms, killing cursor-agent`);
       child.kill();
     }, effectiveTimeout);
-    result = await processStreamOutputWithTimeout(child, { requestId, model, sessionKey, res, streamState }, effectiveTimeout);
+    result = await processStreamOutputWithTimeout(
+      child,
+      { requestId, model, sessionKey, res, streamState, sessionWorkspaceResolved: effWsResolved },
+      effectiveTimeout,
+    );
     clearTimeout(retryTimeout);
     if (clientGone) {
       try { res.end(); } catch {}
@@ -804,7 +875,7 @@ async function handleStream(req, res, body) {
 
 // ── Non-streaming handler ───────────────────────────────────────────────────
 
-function collectNonStreamOutput(child, { requestId, sessionKey }) {
+function collectNonStreamOutput(child, { requestId, sessionKey, sessionWorkspaceResolved }) {
   return new Promise((resolve) => {
     let resolved = false;
     let stdout = "";
@@ -837,7 +908,7 @@ function collectNonStreamOutput(child, { requestId, sessionKey }) {
             if (p.type === "result" && typeof p.result === "string") resultText = p.result;
             if (p.type === "text" && typeof p.text === "string") textAccum += p.text;
             if (p.type === "thinking" && FORWARD_THINKING && p.text) thinkingText += p.text;
-            if (p.session_id && sessionKey) setSession(sessionKey, p.session_id);
+            if (p.session_id && sessionKey) setSession(sessionKey, p.session_id, sessionWorkspaceResolved || undefined);
           } catch {}
         }
       }
@@ -864,7 +935,8 @@ async function handleNonStream(req, res, body) {
   const effectiveTimeout = getEffectiveTimeout();
 
   const requestWorkspace = resolveWorkspaceDirForMessages(body.messages);
-  log("info", `[${requestId}] non-stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${requestWorkspace || WORKSPACE_DIR || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
+  const { raw: effWsRaw, resolved: effWsResolved } = computeSpawnCwd(requestWorkspace || undefined);
+  log("info", `[${requestId}] non-stream request: model=${model}, session=${sessionKey || "none"}(${sessionSrc}), cwd=${effWsRaw || "none"}, timeout=${effectiveTimeout}ms, msg="${msgPreview}${userMsg.length > 80 ? "…" : ""}"`);
 
   const sendError = (err) => {
     res.writeHead(500, { "Content-Type": "application/json" });
@@ -880,7 +952,7 @@ async function handleNonStream(req, res, body) {
     child.kill();
   }, effectiveTimeout);
 
-  let result = await collectNonStreamOutput(child, { requestId, sessionKey });
+  let result = await collectNonStreamOutput(child, { requestId, sessionKey, sessionWorkspaceResolved: effWsResolved });
 
   if (result.error) {
     const errStr = result.error?.message ?? String(result.error);
@@ -904,7 +976,7 @@ async function handleNonStream(req, res, body) {
       log("warn", `[${requestId}] retry timeout after ${effectiveTimeout}ms, killing cursor-agent`);
       child.kill();
     }, effectiveTimeout);
-    result = await collectNonStreamOutput(child, { requestId, sessionKey });
+    result = await collectNonStreamOutput(child, { requestId, sessionKey, sessionWorkspaceResolved: effWsResolved });
     clearTimeout(retryTimeout);
     if (result.error) {
       const errStr = result.error?.message ?? String(result.error);
